@@ -28,15 +28,39 @@ final class ModeEngine {
             let isEngineMode = current.reason?.hasPrefix("Active session") == true
                 || current.reason?.hasPrefix("No active") == true
                 || current.reason?.hasPrefix("Session running") == true
+                || current.reason?.hasPrefix("Idle detected") == true
+                || current.reason?.hasPrefix("Extended idle") == true
+                || current.reason?.hasPrefix("Returned from idle") == true
             if age < 60 && !isEngineMode {
                 return // respect externally-set mode for at least 60s
             }
         }
 
+        // Idle detection: check if user is AFK
+        let idleSeconds = IdleDetector.shared.systemIdleTime()
+        let wasIdle = store.currentMode().map {
+            $0.reason?.hasPrefix("Idle detected") == true
+            || $0.reason?.hasPrefix("Extended idle") == true
+        } ?? false
+
+        // Return-from-idle logging
+        if wasIdle && idleSeconds < 300 {
+            store.updateMode("unfocused", reason: "Returned from idle")
+        }
+
         var mode = "unfocused"
         var reason = "No active session"
 
-        if let session = session {
+        // Idle thresholds override session-based logic (only when there's an active session)
+        if session != nil && idleSeconds > 900 {
+            let mins = Int(idleSeconds / 60)
+            mode = "unfocused"
+            reason = "Extended idle (\(mins) min)"
+        } else if session != nil && idleSeconds > 300 {
+            let mins = Int(idleSeconds / 60)
+            mode = "grounding"
+            reason = "Idle detected (\(mins) min)"
+        } else if let session = session {
             if let startDate = fmt.date(from: session.startedAt) {
                 let mins = Int(Date().timeIntervalSince(startDate) / 60)
                 if mins < 120 {
