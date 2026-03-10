@@ -79,7 +79,9 @@ final class Store {
             .appendingPathComponent(".config/focus")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("focus.db").path
-        dbQueue = try! DatabaseQueue(path: path)
+        var config = Configuration()
+        config.busyMode = .timeout(5) // wait up to 5s for MCP writer locks
+        dbQueue = try! DatabaseQueue(path: path, configuration: config)
     }
 
     // MARK: Migrations

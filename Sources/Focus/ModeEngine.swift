@@ -1,5 +1,7 @@
 import Foundation
 
+private let fmt = ISO8601DateFormatter()
+
 final class ModeEngine {
     static let shared = ModeEngine()
     private var timer: Timer?
@@ -11,17 +13,31 @@ final class ModeEngine {
         }
     }
 
+    deinit { timer?.invalidate() }
+
     func evaluate() {
         let store = Store.shared
         let session = store.currentSession()
         let report = store.latestSelfReport()
 
+        // Don't override a recently-set mode from an MCP client or self-report
+        // Only overwrite modes that this engine itself set (contain "Active session" or "No active")
+        if let current = store.currentMode(),
+           let detectedDate = fmt.date(from: current.detectedAt) {
+            let age = Date().timeIntervalSince(detectedDate)
+            let isEngineMode = current.reason?.hasPrefix("Active session") == true
+                || current.reason?.hasPrefix("No active") == true
+                || current.reason?.hasPrefix("Session running") == true
+            if age < 60 && !isEngineMode {
+                return // respect externally-set mode for at least 60s
+            }
+        }
+
         var mode = "unfocused"
         var reason = "No active session"
 
-        // Base: check for active session
         if let session = session {
-            if let startDate = ISO8601DateFormatter().date(from: session.startedAt) {
+            if let startDate = fmt.date(from: session.startedAt) {
                 let mins = Int(Date().timeIntervalSince(startDate) / 60)
                 if mins < 120 {
                     mode = "focused"
@@ -38,9 +54,9 @@ final class ModeEngine {
 
         // Override: recent self-report
         if let report = report,
-           let reportDate = ISO8601DateFormatter().date(from: report.reportedAt) {
+           let reportDate = fmt.date(from: report.reportedAt) {
             let age = Date().timeIntervalSince(reportDate)
-            if age < 300 { // within 5 min
+            if age < 300 {
                 switch report.mood {
                 case "stuck", "low":
                     mode = "grounding"
