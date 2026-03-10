@@ -20,9 +20,12 @@ final class ModeEngine {
         let session = store.currentSession()
         let report = store.latestSelfReport()
 
-        // Don't override a recently-set mode from an MCP client or self-report
-        // Only overwrite modes that this engine itself set (contain "Active session" or "No active")
-        if let current = store.currentMode(),
+        // Query current mode once — reused for external-mode protection and idle detection
+        let current = store.currentMode()
+
+        // Don't override a recently-set mode from an MCP client or self-report.
+        // Only overwrite modes that this engine itself set.
+        if let current = current,
            let detectedDate = fmt.date(from: current.detectedAt) {
             let age = Date().timeIntervalSince(detectedDate)
             let isEngineMode = current.reason?.hasPrefix("Active session") == true
@@ -38,14 +41,16 @@ final class ModeEngine {
 
         // Idle detection: check if user is AFK
         let idleSeconds = IdleDetector.shared.systemIdleTime()
-        let wasIdle = store.currentMode().map {
+        let wasIdle = current.map {
             $0.reason?.hasPrefix("Idle detected") == true
             || $0.reason?.hasPrefix("Extended idle") == true
         } ?? false
 
-        // Return-from-idle logging
+        // Return-from-idle: log the transition and give the user one visible
+        // "welcome back" tick (~30s) before normal re-evaluation resumes.
         if wasIdle && idleSeconds < 300 {
-            store.updateMode("unfocused", reason: "Returned from idle")
+            store.updateMode("grounding", reason: "Returned from idle")
+            return
         }
 
         var mode = "unfocused"
