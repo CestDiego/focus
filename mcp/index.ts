@@ -22,33 +22,60 @@ import { execSync } from "node:child_process"
 
 // ── types ───────────────────────────────────────
 
-interface SessionRow { id: number }
-interface SessionNameRow { id: number; projectName: string | null }
-interface SessionFullRow {
+export interface SessionRow { id: number }
+export interface SessionNameRow { id: number; projectName: string | null }
+export interface SessionFullRow {
   id: number; projectName: string | null; projectDir: string | null
   gitBranch: string | null; goal: string | null; why: string | null
   source: string | null; startedAt: string; taskSummary: string | null
 }
-interface ModeRow { mode: string; reason: string | null }
-interface ReportRow { mood: string; reportedAt: string }
+export interface ModeRow { mode: string; reason: string | null }
+export interface ReportRow { mood: string; reportedAt: string }
 
-// ── database (single connection for server lifetime) ─
+// ── helpers ─────────────────────────────────────
 
-const DB_DIR = join(homedir(), ".config", "focus")
-const DB_PATH = join(DB_DIR, "focus.db")
-
-function iso(): string {
+export function iso(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z")
 }
 
-function validateDir(dir: string): string {
+export function validateDir(dir: string): string {
   if (!isAbsolute(dir)) throw new Error("projectDir must be an absolute path")
   return resolve(dir)
 }
 
-function initDb(): Database {
-  if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true })
-  const db = new Database(DB_PATH)
+export function gitBranch(dir: string): string | null {
+  try {
+    return execSync("git rev-parse --abbrev-ref HEAD", {
+      cwd: dir, timeout: 5000, encoding: "utf8",
+    }).trim()
+  } catch { return null }
+}
+
+export function findSession(db: Database, projectDir: string, sourceSessionId?: string): SessionRow | null {
+  if (sourceSessionId) {
+    const row = db.query<SessionRow, [string]>(
+      "SELECT id FROM sessions WHERE sourceSessionId = ? AND endedAt IS NULL LIMIT 1"
+    ).get(sourceSessionId)
+    if (row) return row
+  }
+  return db.query<SessionRow, [string]>(
+    "SELECT id FROM sessions WHERE projectDir = ? AND endedAt IS NULL ORDER BY startedAt DESC LIMIT 1"
+  ).get(projectDir)
+}
+
+// ── database ────────────────────────────────────
+
+const DB_DIR = join(homedir(), ".config", "focus")
+const DB_PATH = join(DB_DIR, "focus.db")
+
+export function initDb(existingDb?: Database): Database {
+  let db: Database
+  if (existingDb) {
+    db = existingDb
+  } else {
+    if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true })
+    db = new Database(DB_PATH)
+  }
   db.run("PRAGMA journal_mode=WAL")
   db.run("PRAGMA busy_timeout=5000")
   db.run(`CREATE TABLE IF NOT EXISTS sessions (
@@ -82,224 +109,225 @@ function initDb(): Database {
   return db
 }
 
-// Single connection — reused for all tool calls
-const db = initDb()
+// ── tool handlers (exported for testability) ────
 
-function gitBranch(dir: string): string | null {
-  try {
-    return execSync("git rev-parse --abbrev-ref HEAD", {
-      cwd: dir, timeout: 5000, encoding: "utf8",
-    }).trim()
-  } catch { return null }
-}
+export async function handleSessionStart(db: Database, args: {
+  projectDir: string; goal?: string; why?: string; trigger?: string;
+  source?: string; sourceSessionId?: string;
+}) {
+  const dir = validateDir(args.projectDir)
+  const now = iso()
+  const name = basename(dir)
+  const branch = gitBranch(dir)
 
-function findSession(projectDir: string, sourceSessionId?: string): SessionRow | null {
-  if (sourceSessionId) {
-    const row = db.query<SessionRow, [string]>(
-      "SELECT id FROM sessions WHERE sourceSessionId = ? AND endedAt IS NULL LIMIT 1"
-    ).get(sourceSessionId)
-    if (row) return row
+  const row = findSession(db, dir, args.sourceSessionId)
+
+  let sessionId: number
+  if (row) {
+    sessionId = row.id
+    if (args.goal) db.run("UPDATE sessions SET goal = ? WHERE id = ?", [args.goal, sessionId])
+    if (args.why) db.run("UPDATE sessions SET why = ? WHERE id = ?", [args.why, sessionId])
+    if (args.trigger) db.run('UPDATE sessions SET "trigger" = ? WHERE id = ?', [args.trigger, sessionId])
+    db.run("UPDATE sessions SET gitBranch = ?, source = ?, sourceSessionId = ? WHERE id = ?", [
+      branch, args.source || null, args.sourceSessionId || null, sessionId,
+    ])
+  } else {
+    const result = db.run(
+      'INSERT INTO sessions (phase, goal, why, "trigger", projectDir, projectName, gitBranch, startedAt, source, sourceSessionId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ["during", args.goal || null, args.why || null, args.trigger || null, dir, name, branch, now, args.source || null, args.sourceSessionId || null],
+    )
+    sessionId = Number(result.lastInsertRowid)
   }
-  return db.query<SessionRow, [string]>(
-    "SELECT id FROM sessions WHERE projectDir = ? AND endedAt IS NULL ORDER BY startedAt DESC LIMIT 1"
-  ).get(projectDir)
+
+  db.run("INSERT INTO mode_log (mode, reason, detectedAt) VALUES (?, ?, ?)", [
+    "focused", `Session started: ${name}`, now,
+  ])
+
+  return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, sessionId, project: name, branch }) }] }
 }
 
-// ── server ──────────────────────────────────────
+export async function handleTasksSync(db: Database, args: {
+  projectDir: string; sourceSessionId?: string;
+  tasks: Array<{ content: string; status: string; priority?: string }>;
+}) {
+  const dir = validateDir(args.projectDir)
+  const now = iso()
+  const row = findSession(db, dir, args.sourceSessionId)
 
-const server = new McpServer({
-  name: "focus",
-  version: "0.2.0",
-})
+  if (!row) {
+    return { isError: true, content: [{ type: "text" as const, text: "No active session found. Call focus_session_start first." }] }
+  }
 
-// ── TOOL: focus_session_start ───────────────────
+  const sessionId = row.id
 
-server.tool(
-  "focus_session_start",
-  "Start or resume a focus session. Call this when beginning work on a project. If a session already exists for this project, it will be reused.",
-  {
-    projectDir: z.string().describe("Absolute path to the project directory"),
-    goal: z.string().optional().describe("What you're trying to accomplish in this session"),
-    why: z.string().optional().describe("Why this work matters — the larger purpose"),
-    trigger: z.string().optional().describe("What triggered this focus session"),
-    source: z.string().optional().describe("Client identifier: claude-code, opencode, cursor, etc."),
-    sourceSessionId: z.string().optional().describe("The client's own session ID for correlation"),
-  },
-  async (args) => {
-    const dir = validateDir(args.projectDir)
-    const now = iso()
-    const name = basename(dir)
-    const branch = gitBranch(dir)
-
-    const row = findSession(dir, args.sourceSessionId)
-
-    let sessionId: number
-    if (row) {
-      sessionId = row.id
-      if (args.goal) db.run("UPDATE sessions SET goal = ? WHERE id = ?", [args.goal, sessionId])
-      if (args.why) db.run("UPDATE sessions SET why = ? WHERE id = ?", [args.why, sessionId])
-      if (args.trigger) db.run('UPDATE sessions SET "trigger" = ? WHERE id = ?', [args.trigger, sessionId])
-      db.run("UPDATE sessions SET gitBranch = ?, source = ?, sourceSessionId = ? WHERE id = ?", [
-        branch, args.source || null, args.sourceSessionId || null, sessionId,
-      ])
-    } else {
-      const result = db.run(
-        'INSERT INTO sessions (phase, goal, why, "trigger", projectDir, projectName, gitBranch, startedAt, source, sourceSessionId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ["during", args.goal || null, args.why || null, args.trigger || null, dir, name, branch, now, args.source || null, args.sourceSessionId || null],
-      )
-      sessionId = Number(result.lastInsertRowid)
+  db.transaction(() => {
+    db.run("DELETE FROM tasks WHERE sessionId = ?", [sessionId])
+    const stmt = db.prepare("INSERT INTO tasks (sessionId, content, status, priority, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+    for (const t of args.tasks) {
+      stmt.run(sessionId, t.content, t.status, t.priority || "medium", now, now)
     }
+  })()
 
-    db.run("INSERT INTO mode_log (mode, reason, detectedAt) VALUES (?, ?, ?)", [
-      "focused", `Session started: ${name}`, now,
-    ])
+  db.run("INSERT INTO mode_log (mode, reason, detectedAt) VALUES (?, ?, ?)", [
+    "focused", `Tasks synced: ${args.tasks.length} items`, now,
+  ])
 
-    return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, sessionId, project: name, branch }) }] }
-  },
-)
+  return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, sessionId, taskCount: args.tasks.length }) }] }
+}
 
-// ── TOOL: focus_tasks_sync ──────────────────────
+export async function handleSessionEnd(db: Database, args: {
+  projectDir: string; sourceSessionId?: string; reason: string;
+}) {
+  const dir = validateDir(args.projectDir)
+  const now = iso()
 
-server.tool(
-  "focus_tasks_sync",
-  "Sync the current task list for a project. Replaces all tasks for the matched session. Call this whenever your todo list changes.",
-  {
-    projectDir: z.string().describe("Absolute path to the project directory"),
-    sourceSessionId: z.string().optional().describe("Client session ID for matching"),
-    tasks: z.array(z.object({
-      content: z.string().describe("Task description"),
-      status: z.enum(["pending", "in_progress", "completed"]).describe("Task status"),
-      priority: z.enum(["high", "medium", "low"]).optional().describe("Priority level"),
-    })).describe("The full task list"),
-  },
-  async (args) => {
-    const dir = validateDir(args.projectDir)
-    const now = iso()
-    const row = findSession(dir, args.sourceSessionId)
+  let row: SessionNameRow | null = null
+  if (args.sourceSessionId) {
+    row = db.query<SessionNameRow, [string]>(
+      "SELECT id, projectName FROM sessions WHERE sourceSessionId = ? AND endedAt IS NULL LIMIT 1"
+    ).get(args.sourceSessionId)
+  }
+  if (!row) {
+    row = db.query<SessionNameRow, [string]>(
+      "SELECT id, projectName FROM sessions WHERE projectDir = ? AND endedAt IS NULL ORDER BY startedAt DESC LIMIT 1"
+    ).get(dir)
+  }
+  if (!row) {
+    return { isError: true, content: [{ type: "text" as const, text: "No active session found." }] }
+  }
 
-    if (!row) {
-      return { isError: true, content: [{ type: "text" as const, text: "No active session found. Call focus_session_start first." }] }
-    }
+  db.run("UPDATE sessions SET endedAt = ?, endReason = ?, phase = 'after' WHERE id = ?", [
+    now, args.reason, row.id,
+  ])
+  db.run("INSERT INTO mode_log (mode, reason, detectedAt) VALUES (?, ?, ?)", [
+    "unfocused", `Session ended (${args.reason}): ${row.projectName}`, now,
+  ])
 
-    const sessionId = row.id
+  return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, ended: row.projectName, reason: args.reason }) }] }
+}
 
-    // Transactional replace: no window where tasks are empty
-    db.transaction(() => {
-      db.run("DELETE FROM tasks WHERE sessionId = ?", [sessionId])
-      const stmt = db.prepare("INSERT INTO tasks (sessionId, content, status, priority, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
-      for (const t of args.tasks) {
-        stmt.run(sessionId, t.content, t.status, t.priority || "medium", now, now)
-      }
-    })()
+export async function handleModeSet(db: Database, args: {
+  mode: string; reason?: string;
+}) {
+  db.run("INSERT INTO mode_log (mode, reason, detectedAt) VALUES (?, ?, ?)", [
+    args.mode, args.reason || null, iso(),
+  ])
+  return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, mode: args.mode }) }] }
+}
 
-    db.run("INSERT INTO mode_log (mode, reason, detectedAt) VALUES (?, ?, ?)", [
-      "focused", `Tasks synced: ${args.tasks.length} items`, now,
-    ])
+export async function handleStatus(db: Database) {
+  const sessions = db.query<SessionFullRow, []>(`
+    SELECT s.id, s.projectName, s.projectDir, s.gitBranch, s.goal, s.why,
+           s.source, s.startedAt,
+           GROUP_CONCAT(SUBSTR(t.content, 1, 80) || ' [' || t.status || ']', '; ') as taskSummary
+    FROM sessions s
+    LEFT JOIN tasks t ON t.sessionId = s.id
+    WHERE s.endedAt IS NULL
+    GROUP BY s.id
+    ORDER BY s.startedAt DESC
+  `).all()
 
-    return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, sessionId, taskCount: args.tasks.length }) }] }
-  },
-)
+  const mode = db.query<ModeRow, []>("SELECT mode, reason FROM mode_log ORDER BY detectedAt DESC LIMIT 1").get()
+  const report = db.query<ReportRow, []>("SELECT mood, reportedAt FROM self_reports ORDER BY reportedAt DESC LIMIT 1").get()
 
-// ── TOOL: focus_session_end ─────────────────────
+  const status = {
+    mode: mode?.mode || "unfocused",
+    modeReason: mode?.reason || null,
+    lastMood: report?.mood || null,
+    activeSessions: sessions.map((s) => ({
+      id: s.id,
+      project: s.projectName,
+      dir: s.projectDir,
+      branch: s.gitBranch,
+      goal: s.goal,
+      why: s.why,
+      source: s.source,
+      startedAt: s.startedAt,
+      tasks: s.taskSummary,
+    })),
+  }
 
-server.tool(
-  "focus_session_end",
-  "End a focus session. Call when work is done, abandoned, or needs redefinition.",
-  {
-    projectDir: z.string().describe("Absolute path to the project directory"),
-    sourceSessionId: z.string().optional().describe("Client session ID for matching"),
-    reason: z.enum(["completed", "abandoned", "redefined"]).describe("Why the session ended"),
-  },
-  async (args) => {
-    const dir = validateDir(args.projectDir)
-    const now = iso()
+  return { content: [{ type: "text" as const, text: JSON.stringify(status, null, 2) }] }
+}
 
-    let row: SessionNameRow | null = null
-    if (args.sourceSessionId) {
-      row = db.query<SessionNameRow, [string]>(
-        "SELECT id, projectName FROM sessions WHERE sourceSessionId = ? AND endedAt IS NULL LIMIT 1"
-      ).get(args.sourceSessionId)
-    }
-    if (!row) {
-      row = db.query<SessionNameRow, [string]>(
-        "SELECT id, projectName FROM sessions WHERE projectDir = ? AND endedAt IS NULL ORDER BY startedAt DESC LIMIT 1"
-      ).get(dir)
-    }
-    if (!row) {
-      return { isError: true, content: [{ type: "text" as const, text: "No active session found." }] }
-    }
+// ── server wiring ───────────────────────────────
 
-    db.run("UPDATE sessions SET endedAt = ?, endReason = ?, phase = 'after' WHERE id = ?", [
-      now, args.reason, row.id,
-    ])
-    db.run("INSERT INTO mode_log (mode, reason, detectedAt) VALUES (?, ?, ?)", [
-      "unfocused", `Session ended (${args.reason}): ${row.projectName}`, now,
-    ])
+function createServer(db: Database): McpServer {
+  const server = new McpServer({
+    name: "focus",
+    version: "0.2.0",
+  })
 
-    return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, ended: row.projectName, reason: args.reason }) }] }
-  },
-)
+  server.tool(
+    "focus_session_start",
+    "Start or resume a focus session. Call this when beginning work on a project. If a session already exists for this project, it will be reused.",
+    {
+      projectDir: z.string().describe("Absolute path to the project directory"),
+      goal: z.string().optional().describe("What you're trying to accomplish in this session"),
+      why: z.string().optional().describe("Why this work matters — the larger purpose"),
+      trigger: z.string().optional().describe("What triggered this focus session"),
+      source: z.string().optional().describe("Client identifier: claude-code, opencode, cursor, etc."),
+      sourceSessionId: z.string().optional().describe("The client's own session ID for correlation"),
+    },
+    async (args) => handleSessionStart(db, args),
+  )
 
-// ── TOOL: focus_mode_set ────────────────────────
+  server.tool(
+    "focus_tasks_sync",
+    "Sync the current task list for a project. Replaces all tasks for the matched session. Call this whenever your todo list changes.",
+    {
+      projectDir: z.string().describe("Absolute path to the project directory"),
+      sourceSessionId: z.string().optional().describe("Client session ID for matching"),
+      tasks: z.array(z.object({
+        content: z.string().describe("Task description"),
+        status: z.enum(["pending", "in_progress", "completed"]).describe("Task status"),
+        priority: z.enum(["high", "medium", "low"]).optional().describe("Priority level"),
+      })).describe("The full task list"),
+    },
+    async (args) => handleTasksSync(db, args),
+  )
 
-server.tool(
-  "focus_mode_set",
-  "Set the user's current cognitive mode. Use when you detect the user may be unfocused, or to confirm focus.",
-  {
-    mode: z.enum(["focused", "grounding", "unfocused"]).describe("The cognitive mode"),
-    reason: z.string().optional().describe("Human-readable reason for this mode"),
-  },
-  async (args) => {
-    db.run("INSERT INTO mode_log (mode, reason, detectedAt) VALUES (?, ?, ?)", [
-      args.mode, args.reason || null, iso(),
-    ])
-    return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, mode: args.mode }) }] }
-  },
-)
+  server.tool(
+    "focus_session_end",
+    "End a focus session. Call when work is done, abandoned, or needs redefinition.",
+    {
+      projectDir: z.string().describe("Absolute path to the project directory"),
+      sourceSessionId: z.string().optional().describe("Client session ID for matching"),
+      reason: z.enum(["completed", "abandoned", "redefined"]).describe("Why the session ended"),
+    },
+    async (args) => handleSessionEnd(db, args),
+  )
 
-// ── TOOL: focus_status ──────────────────────────
+  server.tool(
+    "focus_mode_set",
+    "Set the user's current cognitive mode. Use when you detect the user may be unfocused, or to confirm focus.",
+    {
+      mode: z.enum(["focused", "grounding", "unfocused"]).describe("The cognitive mode"),
+      reason: z.string().optional().describe("Human-readable reason for this mode"),
+    },
+    async (args) => handleModeSet(db, args),
+  )
 
-server.tool(
-  "focus_status",
-  "Get the current state of all active focus sessions. Use this to understand what work is in progress across all coding sessions.",
-  {},
-  async () => {
-    const sessions = db.query<SessionFullRow, []>(`
-      SELECT s.id, s.projectName, s.projectDir, s.gitBranch, s.goal, s.why,
-             s.source, s.startedAt,
-             GROUP_CONCAT(SUBSTR(t.content, 1, 80) || ' [' || t.status || ']', '; ') as taskSummary
-      FROM sessions s
-      LEFT JOIN tasks t ON t.sessionId = s.id
-      WHERE s.endedAt IS NULL
-      GROUP BY s.id
-      ORDER BY s.startedAt DESC
-    `).all()
+  server.tool(
+    "focus_status",
+    "Get the current state of all active focus sessions. Use this to understand what work is in progress across all coding sessions.",
+    {},
+    async () => handleStatus(db),
+  )
 
-    const mode = db.query<ModeRow, []>("SELECT mode, reason FROM mode_log ORDER BY detectedAt DESC LIMIT 1").get()
-    const report = db.query<ReportRow, []>("SELECT mood, reportedAt FROM self_reports ORDER BY reportedAt DESC LIMIT 1").get()
+  return server
+}
 
-    const status = {
-      mode: mode?.mode || "unfocused",
-      modeReason: mode?.reason || null,
-      lastMood: report?.mood || null,
-      activeSessions: sessions.map((s) => ({
-        id: s.id,
-        project: s.projectName,
-        dir: s.projectDir,
-        branch: s.gitBranch,
-        goal: s.goal,
-        why: s.why,
-        source: s.source,
-        startedAt: s.startedAt,
-        tasks: s.taskSummary,
-      })),
-    }
+// ── start (only when run directly, not when imported) ─
 
-    return { content: [{ type: "text" as const, text: JSON.stringify(status, null, 2) }] }
-  },
-)
+const isMainModule = import.meta.url === `file://${process.argv[1]}`
+  || process.argv[1]?.endsWith("/mcp/index.ts")
 
-// ── start ───────────────────────────────────────
+if (isMainModule) {
+  const db = initDb()
+  const server = createServer(db)
+  const transport = new StdioServerTransport()
+  await server.connect(transport)
+}
 
-const transport = new StdioServerTransport()
-await server.connect(transport)
+export { createServer }
