@@ -1,0 +1,9 @@
+.build/
+.DS_Store
+.swiftpm/
+Package.resolved
+mcp/node_modules/
+mcp/bun.lock
+*.db
+*.db-wal
+*.db-shm

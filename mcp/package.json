@@ -1,0 +1,9 @@
+{
+  "name": "focus-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Focus — cognitive state tracker",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}
