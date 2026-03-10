@@ -9,15 +9,48 @@ set -euo pipefail
 #
 # Or if already cloned:
 #   ./install.sh
+#   ./install.sh --uninstall   # remove Focus, LaunchAgent, and binary
 # ─────────────────────────────────────────────────────────
 
 FOCUS_DIR="${FOCUS_DIR:-$HOME/Projects/focus}"
 REPO="https://github.com/CestDiego/focus.git"
+PLIST_LABEL="com.focus.app"
+PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+FOCUS_BIN="/usr/local/bin/focus"
 
 info()  { printf "\033[0;34m▸\033[0m %s\n" "$*"; }
 ok()    { printf "\033[0;32m✓\033[0m %s\n" "$*"; }
 warn()  { printf "\033[0;33m!\033[0m %s\n" "$*"; }
 fail()  { printf "\033[0;31m✗\033[0m %s\n" "$*"; exit 1; }
+
+# ── uninstall ────────────────────────────────────────────
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+  info "Uninstalling Focus..."
+
+  # Unload the LaunchAgent
+  launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
+  ok "LaunchAgent unloaded (or was not loaded)"
+
+  # Remove the plist
+  rm -f "$PLIST_PATH"
+  ok "Removed $PLIST_PATH"
+
+  # Remove the binary
+  if [ -f "$FOCUS_BIN" ]; then
+    rm -f "$FOCUS_BIN" 2>/dev/null || {
+      warn "Cannot remove $FOCUS_BIN — trying with sudo"
+      sudo rm -f "$FOCUS_BIN"
+    }
+    ok "Removed $FOCUS_BIN"
+  else
+    ok "Binary already removed"
+  fi
+
+  echo ""
+  ok "Focus uninstalled. Source code remains at $FOCUS_DIR."
+  exit 0
+fi
 
 # ── prerequisites ────────────────────────────────────────
 
@@ -61,7 +94,54 @@ cp .build/release/Focus /usr/local/bin/focus 2>/dev/null || {
   warn "Cannot write to /usr/local/bin — trying with sudo"
   sudo cp .build/release/Focus /usr/local/bin/focus
 }
-ok "Installed: /usr/local/bin/focus"
+ok "Installed: $FOCUS_BIN"
+
+# ── install LaunchAgent ─────────────────────────────────
+
+install_launchagent() {
+  info "Installing LaunchAgent for auto-start on login..."
+
+  mkdir -p "$HOME/Library/LaunchAgents"
+
+  cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${FOCUS_BIN}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/focus.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/focus.err.log</string>
+</dict>
+</plist>
+PLIST
+
+  ok "Wrote $PLIST_PATH"
+
+  # Unload previous version (ignore errors if not loaded)
+  launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
+
+  # Load the new plist
+  launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+  ok "LaunchAgent loaded — Focus will auto-start on login"
+
+  if pgrep -xq "focus" || pgrep -xq "Focus"; then
+    warn "Focus is already running. The LaunchAgent will take effect on next login."
+  fi
+}
+
+install_launchagent
 
 # ── configure MCP: Claude Code ───────────────────────────
 
@@ -189,6 +269,9 @@ ok "Focus installed successfully!"
 echo ""
 echo "  Start it:    focus"
 echo "  Or:          $FOCUS_DIR/.build/release/Focus"
+echo ""
+echo "  Auto-start:  enabled (LaunchAgent)"
+echo "  Uninstall:   ./install.sh --uninstall"
 echo ""
 echo "  Menu bar will show: ◌ focus"
 echo "  MCP tools available in your next coding session."
